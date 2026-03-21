@@ -3,3 +3,6 @@ openpyxl
 matplotlib
 seaborn
 numpy
+streamlit>=1.35.0
+plotly>=5.22.0
+rapidfuzz>=3.9.0
