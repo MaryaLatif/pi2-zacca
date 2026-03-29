@@ -63,7 +63,13 @@ Ces colonnes **ne figurent pas dans les fichiers Excel** — elles sont recalcul
 | `Velocity Score` | `ln(nb tx/jour + 1) + écart relatif` |
 | `Transactions per day` | Nb de tx partageant la même ligne budgétaire + date |
 | `Relative deviation` | `(montant − moyenne) / moyenne` par ligne budgétaire + date |
-| `match_description` | Score RapidFuzz ≥ 90 entre `Description` et `Bénéficiaire` → 0/1 |
+| `rapidfuzz_score` | Score RapidFuzz token_set_ratio (0–100) |
+| `tfidf_cosine` | Similarité cosinus TF-IDF bigramme |
+| `jaccard_score` | Similarité Jaccard sur tokens |
+| `similarity_combined` | 0,6×RapidFuzz + 0,3×TF-IDF + 0,1×Jaccard |
+| `description_match_final` | 1 si ≥ 1 méthode valide la concordance |
+| `description_fraude_signal` | 1 si aucune méthode ne valide (signal fraude) |
+| `match_description` | Alias de `description_match_final` |
 | `is_outlier` | IQR sur le montant : hors `[Q1−1,5×IQR ; Q3+1,5×IQR]` → 0/1 |
 
 **Nouvelles colonnes ajoutées pour le dashboard** :
@@ -118,7 +124,8 @@ with tab1:
         / (len(fr) + len(sened))
         * 100
     )
-    pct_mismatch = fr["match_description"].eq(0).sum() / total_fr * 100
+    fraud_col = "description_fraude_signal" if "description_fraude_signal" in fr.columns else "match_description"
+    pct_mismatch = (fr[fraud_col].eq(1) if fraud_col == "description_fraude_signal" else fr[fraud_col].eq(0)).sum() / total_fr * 100
     dup_ref = int(sened["ref_duplicate"].sum())
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -234,7 +241,9 @@ with tab2:
         lambda v: "Vélocité élevée" if v > vel_threshold else "Normal"
     )
     fr_filtered["is_outlier_label"] = fr_filtered["is_outlier"].map({0: "Normal", 1: "Aberrant"})
-    fr_filtered["match_label"] = fr_filtered["match_description"].map(
+    fr_filtered["match_label"] = fr_filtered["description_match_final"].map(
+        {0: "Discordance", 1: "Concordance"}
+    ) if "description_match_final" in fr_filtered.columns else fr_filtered["match_description"].map(
         {0: "Discordance", 1: "Concordance"}
     )
 
@@ -275,13 +284,33 @@ with tab2:
             y="Nombre",
             color="match_label",
             color_discrete_map={"Discordance": "#ff006e", "Concordance": "#3a86ff"},
-            title="Taux de discordance des descriptions par ligne budgétaire",
+            title="Concordance description/bénéficiaire par ligne budgétaire",
             labels={"match_label": ""},
         )
         st.plotly_chart(fig, use_container_width=True)
         st.caption(
-            "📂 Rapport Financier · Variables : `Budget Line Code`, `match_description` (RapidFuzz ≥ 90) · "
-            "Une barre rouge importante indique que le champ description ne correspond pas au bénéficiaire."
+            "📂 Rapport Financier · Méthode combinée : RapidFuzz 60% + TF-IDF 30% + Jaccard 10% · "
+            "Signal fraude si aucune méthode ne dépasse son seuil (RapidFuzz ≥ 90, TF-IDF ≥ 0.25, score combiné ≥ 0.65)."
+        )
+
+    if "similarity_combined" in fr_filtered.columns:
+        fig = px.histogram(
+            fr_filtered,
+            x="similarity_combined",
+            color="match_label",
+            nbins=30,
+            color_discrete_map={"Discordance": "#ff006e", "Concordance": "#3a86ff"},
+            title="Distribution du score de similarité combiné (RapidFuzz 60% + TF-IDF 30% + Jaccard 10%)",
+            labels={"similarity_combined": "Score combiné", "match_label": ""},
+            barmode="overlay",
+            opacity=0.7,
+        )
+        fig.add_vline(x=0.65, line_dash="dash", line_color="orange",
+                      annotation_text="Seuil combiné (0.65)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "📂 Rapport Financier · Score combiné = 0.6×RapidFuzz + 0.3×TF-IDF cosine + 0.1×Jaccard · "
+            "Les transactions à gauche du seuil (rouge) n'ont aucune méthode qui les valide — signal de fraude potentiel."
         )
 
     fig = px.scatter(
@@ -326,7 +355,8 @@ with tab2:
 
     with st.expander("Matrice de corrélation (colonnes numériques)"):
         num_cols = ["Total Amount In USD", "Velocity Score", "Transactions per day",
-                    "Relative deviation", "is_outlier", "match_description", "invoice_missing"]
+                    "Relative deviation", "is_outlier", "similarity_combined",
+                    "description_match_final", "description_fraude_signal", "invoice_missing"]
         num_cols = [c for c in num_cols if c in fr_filtered.columns]
         corr = fr_filtered[num_cols].corr().round(2)
         fig = px.imshow(
@@ -487,7 +517,8 @@ with tab4:
         "La colonne `flags` liste les signaux actifs sur chaque ligne. "
         "**Les lignes cumulant plusieurs flags sont les priorités d'audit les plus élevées.** "
         "Signaux disponibles — Rapport Financier : `high_velocity` (Velocity Score > 75e pct), "
-        "`mismatch` (description ≠ bénéficiaire), `outlier` (montant aberrant IQR), `invoice_missing` (facture absente). "
+        "`description_fraude` (aucune méthode RapidFuzz/TF-IDF/Jaccard ne valide la concordance), "
+        "`outlier` (montant aberrant IQR), `invoice_missing` (facture absente). "
         "Signaux SENED : `outlier` (montant aberrant IQR), `ref_duplicate` (REF utilisée plusieurs fois). "
         "Le bouton **Exporter en CSV** permet de télécharger la sélection pour la transmettre aux auditeurs."
     )
@@ -500,12 +531,13 @@ with tab4:
 
     if dataset_choice == "Rapport Financier":
         flagged_df = get_finance_flags(fr)
-        all_flags = ["high_velocity", "mismatch", "outlier", "invoice_missing"]
+        all_flags = ["high_velocity", "description_fraude", "outlier", "invoice_missing"]
         display_cols = [
             "Transaction Date", "Budget Line Code", "Description",
             "2nd Description (Recipient)", "Total Amount In USD",
-            "Velocity Score", "match_description", "is_outlier",
-            "invoice_missing", "flags",
+            "Velocity Score", "rapidfuzz_score", "tfidf_cosine", "similarity_combined",
+            "description_match_final", "description_fraude_signal",
+            "is_outlier", "invoice_missing", "flags",
         ]
     else:
         flagged_df = get_sened_flags(sened)
