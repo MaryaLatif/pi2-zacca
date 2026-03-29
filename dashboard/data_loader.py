@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from rapidfuzz import fuzz
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 FINANCE_PATH = DATA_DIR / "finance-report-042024.xlsx"
@@ -47,6 +49,37 @@ def _normalize_text(text) -> str:
 
 def _fuzzy_match(a, b, threshold: int = 90) -> int:
     return int(fuzz.token_set_ratio(_normalize_text(a), _normalize_text(b)) >= threshold)
+
+
+def _tokenize(text) -> list:
+    if pd.isna(text):
+        return []
+    text = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
+    return [t for t in text.split() if len(t) >= 2]
+
+
+def _jaccard_similarity(tokens1: list, tokens2: list) -> float:
+    s1, s2 = set(tokens1), set(tokens2)
+    if not s1 and not s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+
+def _pairwise_tfidf_cosine(desc1: pd.Series, desc2: pd.Series) -> np.ndarray:
+    d1 = desc1.fillna("").astype(str)
+    d2 = desc2.fillna("").astype(str)
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        token_pattern=r"(?u)\b[a-zA-Z0-9]{2,}\b",
+        ngram_range=(1, 2),
+        min_df=1,
+    )
+    vectorizer.fit(pd.concat([d1, d2], axis=0))
+    X1 = vectorizer.transform(d1)
+    X2 = vectorizer.transform(d2)
+    return np.array([cosine_similarity(X1[i], X2[i])[0, 0] for i in range(X1.shape[0])])
 
 
 # Finance Report
@@ -94,14 +127,38 @@ def load_finance_report() -> pd.DataFrame:
         )
 
 
-    if "match_description" not in df.columns:
-        df["match_description"] = df.apply(
-            lambda r: _fuzzy_match(
-                r.get("Description", ""),
-                r.get("2nd Description (Recipient)", ""),
+    # Combined description similarity: RapidFuzz 60% + TF-IDF 30% + Jaccard 10%
+    recip_col = next(
+        (c for c in df.columns if "2nd Description" in c or "Recipent" in c or "Recipient" in c),
+        None,
+    )
+    if recip_col and "description_match_final" not in df.columns:
+        rf_scores = df.apply(
+            lambda r: fuzz.token_set_ratio(
+                _normalize_text(r.get("Description", "")),
+                _normalize_text(r.get(recip_col, "")),
             ),
             axis=1,
+        ).astype(float)
+        tfidf_cos = _pairwise_tfidf_cosine(df["Description"], df[recip_col])
+        tokens1 = df["Description"].apply(_tokenize)
+        tokens2 = df[recip_col].apply(_tokenize)
+        jaccard = pd.Series(
+            [_jaccard_similarity(a, b) for a, b in zip(tokens1, tokens2)],
+            index=df.index,
         )
+        df["rapidfuzz_score"] = rf_scores
+        df["tfidf_cosine"] = tfidf_cos
+        df["jaccard_score"] = jaccard
+        df["similarity_combined"] = (
+            0.6 * (rf_scores / 100) + 0.3 * tfidf_cos + 0.1 * jaccard
+        )
+        df["description_match_final"] = (
+            (rf_scores >= 90) | (tfidf_cos >= 0.25) | (df["similarity_combined"] >= 0.65)
+        ).astype(int)
+        df["description_fraude_signal"] = (df["description_match_final"] == 0).astype(int)
+        # keep match_description as alias for backward compat
+        df["match_description"] = df["description_match_final"]
 
     df["is_outlier"] = _iqr_outlier_flag(df["Total Amount In USD"])
 
@@ -185,14 +242,15 @@ def load_sened_transactions() -> pd.DataFrame:
 def get_finance_flags(df: pd.DataFrame) -> pd.DataFrame:
     vel_threshold = df["Velocity Score"].quantile(0.75)
 
+    fraud_col = "description_fraude_signal" if "description_fraude_signal" in df.columns else "match_description"
     conditions = {
         "high_velocity": df["Velocity Score"] > vel_threshold,
-        "mismatch": df["match_description"] == 0,
+        "description_fraude": df[fraud_col] == 1 if fraud_col == "description_fraude_signal" else df[fraud_col] == 0,
         "outlier": df["is_outlier"] == 1,
         "invoice_missing": df["invoice_missing"] == 1,
     }
 
-    mask = conditions["high_velocity"] | conditions["mismatch"] | conditions["outlier"] | conditions["invoice_missing"]
+    mask = conditions["high_velocity"] | conditions["description_fraude"] | conditions["outlier"] | conditions["invoice_missing"]
     flagged = df[mask].copy()
 
     flagged["flags"] = flagged.apply(
