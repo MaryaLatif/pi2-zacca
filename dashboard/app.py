@@ -1,12 +1,16 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dashboard.data_loader import (
+    get_regression_model,
     get_finance_flags,
     get_sened_flags,
     load_finance_report,
@@ -103,8 +107,8 @@ Une concentration anormale sur un code (ex. `4.5`) ou une devise inattendue (USD
 - 🟠 **Ligne orange pointillée** → seuil ajustable (Velocity Score)
 """)
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Vue d'ensemble", "Rapport Financier", "Transactions SENED", "Transactions Suspectes"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Vue d'ensemble", "Rapport Financier", "Transactions SENED", "Transactions Suspectes", "Régression Linéaire"]
 )
 
 # ONGLET 1 — Vue d'ensemble
@@ -573,4 +577,172 @@ with tab4:
         data=csv,
         file_name=f"suspects_{dataset_choice.lower().replace(' ', '_')}.csv",
         mime="text/csv",
+    )
+
+# ── ONGLET 5 — Régression Linéaire ───────────────────────────────────────────
+
+with tab5:
+    st.subheader("Régression Linéaire — Prédiction du Velocity Score")
+    st.info(
+        "**Objectif :** prédire le `Velocity Score` d'une transaction à partir de trois features : "
+        "`Total Amount In USD`, `Transactions per day` et `Relative deviation`. "
+        "Un Velocity Score élevé indique une transaction potentiellement suspecte. "
+        "Le modèle permet d'**estimer ce score sur de nouvelles transactions** avant de les enregistrer, "
+        "et d'identifier quelles variables pèsent le plus dans le risque calculé."
+    )
+
+    # ── Contrôles ─────────────────────────────────────────────────────────────
+    reg_col1, reg_col2 = st.columns(2)
+    with reg_col1:
+        test_size = st.slider(
+            "Taille du jeu de test (%)",
+            min_value=10, max_value=40, value=20, step=5,
+            key="reg_test_size",
+        ) / 100
+    with reg_col2:
+        random_state = st.number_input(
+            "Random state", value=42, step=1, key="reg_random_state"
+        )
+
+    # ── Entraînement ──────────────────────────────────────────────────────────
+    try:
+        res = get_regression_model(fr, test_size=test_size, random_state=int(random_state))
+    except ValueError as e:
+        st.error(f"Impossible d'entraîner le modèle : {e}")
+        st.stop()
+
+    # ── KPIs ──────────────────────────────────────────────────────────────────
+    st.subheader("Métriques du modèle")
+    m1, m2, m3, m4 = st.columns(4)
+    n_total = len(res["y_test"]) + len(res["y_pred_train"])
+    m1.metric("R² (entraînement)", f"{res['r2_train']:.4f}")
+    m2.metric("R² (test)",         f"{res['r2_test']:.4f}")
+    m3.metric("RMSE (test)",       f"{res['rmse_test']:.4f}")
+    m4.metric("Échantillons",      f"{len(res['y_test'])} test / {n_total} total")
+
+    st.divider()
+
+    # ── Scatter réel vs prédit ─────────────────────────────────────────────────
+    scatter_col, resid_col = st.columns(2)
+
+    with scatter_col:
+        scatter_df = pd.DataFrame(
+            {"Réel": res["y_test"].values, "Prédit": res["y_pred_test"]}
+        )
+        diag_min = float(scatter_df["Réel"].min())
+        diag_max = float(scatter_df["Réel"].max())
+        fig_scatter = px.scatter(
+            scatter_df,
+            x="Réel",
+            y="Prédit",
+            opacity=0.6,
+            title="Réel vs Prédit (jeu de test)",
+            labels={"Réel": "Velocity Score réel", "Prédit": "Velocity Score prédit"},
+            color_discrete_sequence=["#3a86ff"],
+        )
+        fig_scatter.add_trace(go.Scatter(
+            x=[diag_min, diag_max],
+            y=[diag_min, diag_max],
+            mode="lines",
+            name="Prédiction parfaite",
+            line=dict(color="#ff006e", dash="dash", width=2),
+        ))
+        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.caption(
+            "Chaque point est une transaction du jeu de test. "
+            "Plus les points s'alignent sur la diagonale rouge, meilleure est la prédiction."
+        )
+
+    # ── Distribution des résidus ───────────────────────────────────────────────
+    with resid_col:
+        residuals = res["y_test"].values - res["y_pred_test"]
+        fig_resid = px.histogram(
+            x=residuals,
+            nbins=40,
+            title="Distribution des résidus",
+            labels={"x": "Résidu (réel − prédit)"},
+            color_discrete_sequence=["#ff006e"],
+            opacity=0.8,
+        )
+        fig_resid.add_vline(x=0, line_dash="dash", line_color="black",
+                            annotation_text="Résidu = 0")
+        st.plotly_chart(fig_resid, use_container_width=True)
+        st.caption(
+            "Un histogramme centré sur 0 indique que le modèle ne sur-estime ni ne sous-estime "
+            "systématiquement. Un décalage ou une asymétrie signale un biais."
+        )
+
+    # ── Coefficients ──────────────────────────────────────────────────────────
+    st.subheader("Importance des features (coefficients)")
+    coef_df = (
+        pd.DataFrame({
+            "Feature":     res["feature_names"],
+            "Coefficient": list(res["coefficients"].values()),
+        })
+        .sort_values("Coefficient", key=abs, ascending=True)
+    )
+    fig_coef = px.bar(
+        coef_df,
+        x="Coefficient",
+        y="Feature",
+        orientation="h",
+        title="Coefficients de la régression linéaire",
+        color="Coefficient",
+        color_continuous_scale="RdBu",
+        color_continuous_midpoint=0,
+    )
+    st.plotly_chart(fig_coef, use_container_width=True)
+    st.caption(
+        "Un coefficient positif élève le Velocity Score quand la feature augmente (signal de risque accru). "
+        "Un coefficient négatif l'atténue. La magnitude indique le poids de chaque variable."
+    )
+
+    with st.expander("📐 Équation du modèle"):
+        terms = " + ".join(
+            f"{coef:.4f} × {feat}" for feat, coef in res["coefficients"].items()
+        )
+        st.code(f"Velocity Score = {res['intercept']:.4f} + {terms}", language="text")
+
+    st.divider()
+
+    # ── Simulateur de transaction ──────────────────────────────────────────────
+    st.subheader("🔮 Simuler une transaction")
+    st.caption(
+        "Entrez les caractéristiques d'une transaction pour estimer son Velocity Score "
+        "et évaluer son niveau de risque avant enregistrement."
+    )
+
+    sim_c1, sim_c2, sim_c3 = st.columns(3)
+    with sim_c1:
+        inp_amount = st.number_input(
+            "Total Amount In USD", value=1000.0, step=100.0, key="sim_amount"
+        )
+    with sim_c2:
+        inp_txday = st.number_input(
+            "Transactions per day", value=3, step=1, min_value=1, key="sim_txday"
+        )
+    with sim_c3:
+        inp_reldev = st.number_input(
+            "Relative deviation", value=0.0, step=0.1, format="%.2f", key="sim_reldev"
+        )
+
+    pred_score = res["model"].predict(
+        np.array([[inp_amount, inp_txday, inp_reldev]])
+    )[0]
+
+    vel_p75 = float(fr["Velocity Score"].quantile(0.75))
+    vel_p90 = float(fr["Velocity Score"].quantile(0.90))
+
+    if pred_score < vel_p75:
+        risk_label, risk_color = "🟢 Risque faible", "normal"
+    elif pred_score < vel_p90:
+        risk_label, risk_color = "🟠 Risque modéré", "off"
+    else:
+        risk_label, risk_color = "🔴 Risque élevé", "inverse"
+
+    st.metric(
+        label=f"Velocity Score prédit — {risk_label}",
+        value=f"{pred_score:.4f}",
+        delta=f"Seuil P75 = {vel_p75:.2f} · P90 = {vel_p90:.2f}",
+        delta_color=risk_color,
     )

@@ -5,9 +5,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from typing import Any
 from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, root_mean_squared_error
+from sklearn.model_selection import train_test_split
+
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 FINANCE_PATH = DATA_DIR / "finance-report-042024.xlsx"
@@ -278,3 +283,66 @@ def get_sened_flags(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
     return flagged
+
+# ─── Linear Regression Model ────────────────────────────────────────────────
+ 
+REGRESSION_FEATURES = ["Total Amount In USD", "Transactions per day", "Relative deviation"]
+REGRESSION_TARGET   = "Velocity Score"
+ 
+ 
+@st.cache_data
+def get_regression_model(
+    df: pd.DataFrame,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Train a LinearRegression model to predict Velocity Score.
+ 
+    Returns a dict with:
+        model         – fitted LinearRegression
+        X_test        – test features (DataFrame)
+        y_test        – true target values (Series)
+        y_pred_test   – predicted values on test set (ndarray)
+        y_pred_train  – predicted values on train set (ndarray)
+        r2_train      – R² on training set
+        r2_test       – R² on test set
+        rmse_test     – RMSE on test set
+        feature_names – list of feature column names
+        coefficients  – dict {feature: coef}
+        intercept     – model intercept
+    """
+    required = REGRESSION_FEATURES + [REGRESSION_TARGET]
+    missing  = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for regression: {missing}")
+ 
+    clean = df[required].dropna()
+    if len(clean) < 10:
+        raise ValueError("Not enough data after dropping NaNs (need at least 10 rows).")
+ 
+    X = clean[REGRESSION_FEATURES]
+    y = clean[REGRESSION_TARGET]
+ 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state
+    )
+ 
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+ 
+    y_pred_train = model.predict(X_train)
+    y_pred_test  = model.predict(X_test)
+ 
+    return {
+        "model":         model,
+        "X_test":        X_test,
+        "y_test":        y_test,
+        "y_pred_test":   y_pred_test,
+        "y_pred_train":  y_pred_train,
+        "r2_train":      r2_score(y_train, y_pred_train),
+        "r2_test":       r2_score(y_test, y_pred_test),
+        "rmse_test":     root_mean_squared_error(y_test, y_pred_test),
+        "feature_names": REGRESSION_FEATURES,
+        "coefficients":  dict(zip(REGRESSION_FEATURES, model.coef_)),
+        "intercept":     model.intercept_,
+    }
